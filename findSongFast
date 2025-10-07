@@ -1,0 +1,43 @@
+import asyncio
+import os
+import sys
+from shazamio import Shazam
+from moviepy.editor import VideoFileClip
+import yt_dlp
+
+# 🧠 Force MoviePy, Pydub, and ShazamIO to use your local FFmpeg path
+FFMPEG_BIN = r"your ffmpeg destination"
+os.environ["PATH"] = FFMPEG_BIN + os.pathsep + os.environ["PATH"]
+os.environ["IMAGEIO_FFMPEG_EXE"] = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
+os.environ["FFMPEG_BINARY"] = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
+
+print(f"[INFO] Using FFmpeg from: {os.environ['IMAGEIO_FFMPEG_EXE']}")
+
+url = "https://www.facebook.com/watch/?v=1327310078292736"
+video_path = "facebook_reel.mp4"
+audio_path = "facebook_reel.mp3"
+
+# Download the video
+if not os.path.exists(video_path):
+    ydl_opts = {"outtmpl": video_path, "format": "best"}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+# Extract audio
+if not os.path.exists(audio_path):
+    clip = VideoFileClip(video_path)
+    clip.audio.write_audiofile(audio_path, codec="mp3")
+    clip.close()
+
+# Recognize song
+async def detect_song():
+    shazam = Shazam()
+    result = await shazam.recognize_song(audio_path)
+    if "track" in result:
+        title = result["track"]["title"]
+        artist = result["track"]["subtitle"]
+        print(f"🎶 Song detected: {title} - {artist}")
+    else:
+        print("❌ No song detected.")
+
+asyncio.run(detect_song())
