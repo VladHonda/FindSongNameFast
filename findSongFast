@@ -1,43 +1,65 @@
 import asyncio
 import os
-import sys
-from shazamio import Shazam
-from moviepy.editor import VideoFileClip
 import yt_dlp
+import numpy as np
+import soundfile as sf
+from shazamio import Shazam
+from pydub import AudioSegment
+import tempfile
 
-# 🧠 Force MoviePy, Pydub, and ShazamIO to use your local FFmpeg path
-FFMPEG_BIN = r"your ffmpeg destination"
-os.environ["PATH"] = FFMPEG_BIN + os.pathsep + os.environ["PATH"]
-os.environ["IMAGEIO_FFMPEG_EXE"] = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
-os.environ["FFMPEG_BINARY"] = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
+URL = "https://www.facebook.com/watch/?v=1327310078292736"
+AUDIO_PATH = "facebook_audio.m4a"  # downloaded audio
+SEGMENT_DURATION = 10  # seconds
 
-print(f"[INFO] Using FFmpeg from: {os.environ['IMAGEIO_FFMPEG_EXE']}")
-
-url = "https://www.facebook.com/watch/?v=1327310078292736"
-video_path = "facebook_reel.mp4"
-audio_path = "facebook_reel.mp3"
-
-# Download the video
-if not os.path.exists(video_path):
-    ydl_opts = {"outtmpl": video_path, "format": "best"}
+# === Download audio without postprocessing ===
+if not os.path.exists(AUDIO_PATH):
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": AUDIO_PATH,
+        "postprocessors": [],
+        "quiet": False
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        ydl.download([URL])
+    print(f"[INFO] Audio downloaded: {AUDIO_PATH}")
 
-# Extract audio
-if not os.path.exists(audio_path):
-    clip = VideoFileClip(video_path)
-    clip.audio.write_audiofile(audio_path, codec="mp3")
-    clip.close()
-
-# Recognize song
-async def detect_song():
+# === Function to detect song from segments ===
+async def detect_song_from_segments(segment_duration=10):
     shazam = Shazam()
-    result = await shazam.recognize_song(audio_path)
-    if "track" in result:
-        title = result["track"]["title"]
-        artist = result["track"]["subtitle"]
-        print(f"🎶 Song detected: {title} - {artist}")
-    else:
-        print("❌ No song detected.")
+    audio = AudioSegment.from_file(AUDIO_PATH)
+    audio = audio.set_channels(1)  # mono
+    samplerate = audio.frame_rate
 
-asyncio.run(detect_song())
+    # Convert audio to numpy array normalized to [-1,1]
+    samples = np.array(audio.get_array_of_samples(), dtype=np.float32) / (2**15)
+    total_samples = len(samples)
+    total_duration = total_samples / samplerate
+
+    for start in range(0, int(total_duration), segment_duration):
+        end = min(start + segment_duration, total_duration)
+        start_sample = int(start * samplerate)
+        end_sample = int(end * samplerate)
+        segment = samples[start_sample:end_sample]
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, segment, samplerate)
+            tmp_path = tmp.name
+
+        # Use the updated recognize method
+        try:
+            result = await shazam.recognize(tmp_path)
+        except Exception:
+            result = {}
+
+        os.unlink(tmp_path)
+
+        if "track" in result:
+            title = result["track"]["title"]
+            artist = result["track"]["subtitle"]
+            print(f"🎶 Song detected: {title} - {artist}")
+            return
+
+    print("❌ No song detected in any segment.")
+
+# === Run ===
+asyncio.run(detect_song_from_segments(segment_duration=SEGMENT_DURATION))
