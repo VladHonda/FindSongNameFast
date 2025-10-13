@@ -6,22 +6,33 @@ import soundfile as sf
 from shazamio import Shazam
 from pydub import AudioSegment
 import tempfile
+from urllib.parse import urlparse, parse_qs
 
-URL = "https://www.facebook.com/watch/?v=1327310078292736"
-AUDIO_PATH = "facebook_audio.m4a"  # downloaded audio
+# === Config ===
+URL = "https://youtu.be/7FInKGpf1tU?si=qEbbe3x62zZh-TYV&t=206"
 SEGMENT_DURATION = 10  # seconds
 
-# === Download audio without postprocessing ===
+# === Extract start time from URL if present ===
+parsed = urlparse(URL)
+qs = parse_qs(parsed.query)
+START_TIME = int(qs.get("t", [0])[0].replace("s", ""))  # default 0
+VIDEO_ID = qs.get("v", [parsed.path.split('/')[-1]])[0]
+AUDIO_PATH = f"{VIDEO_ID}_{START_TIME}.m4a"
+
+# === Download audio from start time ===
 if not os.path.exists(AUDIO_PATH):
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": AUDIO_PATH,
         "postprocessors": [],
-        "quiet": False
+        "quiet": False,
+        "download_sections": {f"*{START_TIME}-"}  # start from t=START_TIME
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([URL])
-    print(f"[INFO] Audio downloaded: {AUDIO_PATH}")
+    print(f"[INFO] Audio downloaded from {START_TIME}s: {AUDIO_PATH}")
+else:
+    print(f"[INFO] Using existing audio: {AUDIO_PATH}")
 
 # === Function to detect song from segments ===
 async def detect_song_from_segments(segment_duration=10):
@@ -30,7 +41,6 @@ async def detect_song_from_segments(segment_duration=10):
     audio = audio.set_channels(1)  # mono
     samplerate = audio.frame_rate
 
-    # Convert audio to numpy array normalized to [-1,1]
     samples = np.array(audio.get_array_of_samples(), dtype=np.float32) / (2**15)
     total_samples = len(samples)
     total_duration = total_samples / samplerate
@@ -45,7 +55,6 @@ async def detect_song_from_segments(segment_duration=10):
             sf.write(tmp.name, segment, samplerate)
             tmp_path = tmp.name
 
-        # Use the updated recognize method
         try:
             result = await shazam.recognize(tmp_path)
         except Exception:
