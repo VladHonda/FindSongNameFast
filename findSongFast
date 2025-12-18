@@ -1,58 +1,109 @@
 import asyncio
 import os
-import yt_dlp
-import numpy as np
-import soundfile as sf
-from shazamio import Shazam
-from pydub import AudioSegment
+import time
+import hmac
+import hashlib
+import base64
 import tempfile
 from urllib.parse import urlparse, parse_qs
 
-# === Config ===
-URL = "https://youtu.be/7FInKGpf1tU?si=qEbbe3x62zZh-TYV&t=206"
+import yt_dlp
+import numpy as np
+import soundfile as sf
+from pydub import AudioSegment
+from shazamio import Shazam
+import aiohttp
+
+
+# ================= CONFIG =================
+URL = "https://www.facebook.com/reel/845838578149121"
 SEGMENT_DURATION = 10  # seconds
 
-# === Extract start time from URL if present ===
-parsed = urlparse(URL)
-qs = parse_qs(parsed.query)
-START_TIME = int(qs.get("t", [0])[0].replace("s", ""))  # default 0
-VIDEO_ID = qs.get("v", [parsed.path.split('/')[-1]])[0]
-AUDIO_PATH = f"{VIDEO_ID}_{START_TIME}.m4a"
+# Optional ACRCloud
+ACRCLOUD_ACCESS_KEY = "YOUR_ACRCLOUD_ACCESS_KEY"
+ACRCLOUD_ACCESS_SECRET = "YOUR_ACRCLOUD_ACCESS_SECRET"
+ACRCLOUD_HOST = "identify-eu-west-1.acrcloud.com"
 
-# === Download audio from start time ===
-if not os.path.exists(AUDIO_PATH):
+
+# ================= PLATFORM DETECTION =================
+def detect_platform(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if "facebook.com" in host or "fb.watch" in host:
+        return "facebook"
+    if "youtube.com" in host or "youtu.be" in host:
+        return "youtube"
+    return "unknown"
+
+
+# ================= URL PARSER =================
+def parse_url(url: str):
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    platform = detect_platform(url)
+
+    start_time = 0
+    video_id = "audio"
+
+    if platform == "youtube":
+        start_time = int(qs.get("t", ["0"])[0].replace("s", ""))
+        video_id = qs.get("v", ["youtube_video"])[0]
+
+    elif platform == "facebook":
+        video_id = parsed.path.strip("/").split("/")[-1]
+
+    else:
+        raise ValueError("Unsupported platform")
+
+    return platform, video_id, start_time
+
+
+# ================= AUDIO DOWNLOAD (NO FFMPEG) =================
+def download_audio(url, platform, audio_path, start_time):
+    if os.path.exists(audio_path):
+        print(f"[INFO] Using cached audio: {audio_path}")
+        return
+
     ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": AUDIO_PATH,
-        "postprocessors": [],
+        "format": "bestaudio",
+        "outtmpl": audio_path,
         "quiet": False,
-        "download_sections": {f"*{START_TIME}-"}  # start from t=START_TIME
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([URL])
-    print(f"[INFO] Audio downloaded from {START_TIME}s: {AUDIO_PATH}")
-else:
-    print(f"[INFO] Using existing audio: {AUDIO_PATH}")
 
-# === Function to detect song from segments ===
-async def detect_song_from_segments(segment_duration=10):
-    shazam = Shazam()
-    audio = AudioSegment.from_file(AUDIO_PATH)
-    audio = audio.set_channels(1)  # mono
-    samplerate = audio.frame_rate
+        # 🔥 HARD DISABLE POSTPROCESSING / FFMPEG
+        "postprocessors": [],
+        "prefer_ffmpeg": False,
+        "merge_output_format": None,
+    }
+
+    if platform == "youtube" and start_time > 0:
+        ydl_opts["download_sections"] = {f"*{start_time}-"}
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    print(f"[INFO] Audio downloaded: {audio_path}")
+
+
+# ================= AUDIO SEGMENTS =================
+def generate_segments(audio_path, segment_duration):
+    audio = AudioSegment.from_file(audio_path)
+    audio = audio.set_channels(1)
+    sr = audio.frame_rate
 
     samples = np.array(audio.get_array_of_samples(), dtype=np.float32) / (2**15)
-    total_samples = len(samples)
-    total_duration = total_samples / samplerate
+    total_duration = len(samples) / sr
 
     for start in range(0, int(total_duration), segment_duration):
         end = min(start + segment_duration, total_duration)
-        start_sample = int(start * samplerate)
-        end_sample = int(end * samplerate)
-        segment = samples[start_sample:end_sample]
+        yield samples[int(start * sr):int(end * sr)], sr
 
+
+# ================= SHAZAM =================
+async def detect_shazam(audio_path, segment_duration):
+    shazam = Shazam()
+
+    for segment, sr in generate_segments(audio_path, segment_duration):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, segment, samplerate)
+            sf.write(tmp.name, segment, sr)
             tmp_path = tmp.name
 
         try:
@@ -63,12 +114,72 @@ async def detect_song_from_segments(segment_duration=10):
         os.unlink(tmp_path)
 
         if "track" in result:
-            title = result["track"]["title"]
-            artist = result["track"]["subtitle"]
-            print(f"🎶 Song detected: {title} - {artist}")
-            return
+            print(f"🎶 Shazam: {result['track']['title']} - {result['track']['subtitle']}")
+            return True
 
-    print("❌ No song detected in any segment.")
+    print("❌ Shazam: No match")
+    return False
 
-# === Run ===
-asyncio.run(detect_song_from_segments(segment_duration=SEGMENT_DURATION))
+
+# ================= ACRCLOUD =================
+async def detect_acrcloud(audio_path, segment_duration):
+    if not ACRCLOUD_ACCESS_KEY or not ACRCLOUD_ACCESS_SECRET:
+        return False
+
+    for segment, sr in generate_segments(audio_path, segment_duration):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, segment, sr)
+            tmp_path = tmp.name
+
+        timestamp = str(int(time.time()))
+        string_to_sign = f"POST\n/v1/identify\n{ACRCLOUD_ACCESS_KEY}\naudio\n1\n{timestamp}"
+        signature = base64.b64encode(
+            hmac.new(ACRCLOUD_ACCESS_SECRET.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+        ).decode()
+
+        data = {
+            "access_key": ACRCLOUD_ACCESS_KEY,
+            "sample_bytes": os.path.getsize(tmp_path),
+            "timestamp": timestamp,
+            "signature": signature,
+            "data_type": "audio",
+            "signature_version": "1",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            with open(tmp_path, "rb") as f:
+                async with session.post(
+                    f"https://{ACRCLOUD_HOST}/v1/identify",
+                    data={**data, "sample": f},
+                ) as resp:
+                    result = await resp.json()
+
+        os.unlink(tmp_path)
+
+        if result.get("status", {}).get("code") == 0:
+            music = result["metadata"]["music"][0]
+            print(f"🎶 ACRCloud: {music['title']} - {music['artists'][0]['name']}")
+            return True
+
+    print("❌ ACRCloud: No match")
+    return False
+
+
+# ================= MAIN =================
+async def main():
+    platform, video_id, start_time = parse_url(URL)
+    audio_path = f"{video_id}_{start_time}.m4a"
+
+    print(f"[INFO] Platform detected: {platform}")
+
+    download_audio(URL, platform, audio_path, start_time)
+
+    found = await detect_shazam(audio_path, SEGMENT_DURATION)
+
+    if not found:
+        await detect_acrcloud(audio_path, SEGMENT_DURATION)
+
+
+# ================= RUN =================
+if __name__ == "__main__":
+    asyncio.run(main())
