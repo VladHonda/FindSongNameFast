@@ -1,185 +1,98 @@
 import asyncio
 import os
-import time
-import hmac
-import hashlib
-import base64
-import tempfile
-from urllib.parse import urlparse, parse_qs
-
+from urllib.parse import urlparse
 import yt_dlp
-import numpy as np
-import soundfile as sf
-from pydub import AudioSegment
 from shazamio import Shazam
-import aiohttp
-
+from datetime import datetime
 
 # ================= CONFIG =================
-URL = "https://www.facebook.com/reel/845838578149121"
+URL = "https://www.facebook.com/reel/905121505331321"
 SEGMENT_DURATION = 10  # seconds
 
-# Optional ACRCloud
-ACRCLOUD_ACCESS_KEY = "YOUR_ACRCLOUD_ACCESS_KEY"
-ACRCLOUD_ACCESS_SECRET = "YOUR_ACRCLOUD_ACCESS_SECRET"
-ACRCLOUD_HOST = "identify-eu-west-1.acrcloud.com"
-
-
-# ================= PLATFORM DETECTION =================
-def detect_platform(url: str) -> str:
-    host = urlparse(url).netloc.lower()
-    if "facebook.com" in host or "fb.watch" in host:
-        return "facebook"
-    if "youtube.com" in host or "youtu.be" in host:
-        return "youtube"
-    return "unknown"
-
-
-# ================= URL PARSER =================
-def parse_url(url: str):
+# ================= SAFE FILENAME FROM URL =================
+def safe_filename_from_url(url: str) -> str:
+    """
+    Generate a Windows-safe filename from URL using only strings.
+    Keeps only letters, digits, '-' and '_'.
+    """
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    platform = detect_platform(url)
+    video_id = parsed.path.strip("/").split("/")[-1]
 
-    start_time = 0
-    video_id = "audio"
+    safe_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    cleaned = "".join(ch for ch in video_id if ch in safe_chars)
 
-    if platform == "youtube":
-        start_time = int(qs.get("t", ["0"])[0].replace("s", ""))
-        video_id = qs.get("v", ["youtube_video"])[0]
+    if not cleaned:
+        cleaned = "unknown"
 
-    elif platform == "facebook":
-        video_id = parsed.path.strip("/").split("/")[-1]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{cleaned}_first_10_seconds_{timestamp}.wav"
 
-    else:
-        raise ValueError("Unsupported platform")
+# Output filename
+OUTPUT_FILE = safe_filename_from_url(URL)
 
-    return platform, video_id, start_time
-
-
-# ================= AUDIO DOWNLOAD (NO FFMPEG) =================
-def download_audio(url, platform, audio_path, start_time):
-    if os.path.exists(audio_path):
-        print(f"[INFO] Using cached audio: {audio_path}")
-        return
+# ================= AUDIO DOWNLOAD =================
+def download_audio_segment(url: str, output_path: str):
+    print("[INFO] Downloading first 10 seconds...")
 
     ydl_opts = {
-        "format": "bestaudio",
-        "outtmpl": audio_path,
-        "quiet": False,
-
-        # 🔥 HARD DISABLE POSTPROCESSING / FFMPEG
-        "postprocessors": [],
-        "prefer_ffmpeg": False,
-        "merge_output_format": None,
+        "format": "bestaudio[ext=m4a]/bestaudio",   # audio only
+        "cookiesfrombrowser": ("firefox",),         # Firefox cookies for auth
+        "outtmpl": "temp_audio.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "download_sections": [{"start_time": 0, "end_time": SEGMENT_DURATION}],
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "wav",
+            "preferredquality": "192",
+        }],
     }
-
-    if platform == "youtube" and start_time > 0:
-        ydl_opts["download_sections"] = {f"*{start_time}-"}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    print(f"[INFO] Audio downloaded: {audio_path}")
+    # Pick the most recently created WAV file to rename
+    wav_files = [f for f in os.listdir() if f.endswith(".wav")]
+    if not wav_files:
+        raise Exception("No WAV file found after download")
+
+    latest_wav = max(wav_files, key=lambda f: os.path.getmtime(f))
+    os.rename(latest_wav, output_path)
+
+    print(f"[SUCCESS] Audio segment saved as {output_path}")
 
 
-# ================= AUDIO SEGMENTS =================
-def generate_segments(audio_path, segment_duration):
-    audio = AudioSegment.from_file(audio_path)
-    audio = audio.set_channels(1)
-    sr = audio.frame_rate
-
-    samples = np.array(audio.get_array_of_samples(), dtype=np.float32) / (2**15)
-    total_duration = len(samples) / sr
-
-    for start in range(0, int(total_duration), segment_duration):
-        end = min(start + segment_duration, total_duration)
-        yield samples[int(start * sr):int(end * sr)], sr
-
-
-# ================= SHAZAM =================
-async def detect_shazam(audio_path, segment_duration):
+# ================= SHAZAM DETECTION =================
+async def detect_song(audio_path: str):
+    print("[INFO] Sending audio to Shazam...")
     shazam = Shazam()
 
-    for segment, sr in generate_segments(audio_path, segment_duration):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, segment, sr)
-            tmp_path = tmp.name
+    try:
+        # recognize_song ensures fresh recognition of the given file
+        result = await shazam.recognize_song(audio_path)
+    except Exception as e:
+        print(f"[ERROR] Shazam failed: {e}")
+        return
 
-        try:
-            result = await shazam.recognize(tmp_path)
-        except Exception:
-            result = {}
-
-        os.unlink(tmp_path)
-
-        if "track" in result:
-            print(f"🎶 Shazam: {result['track']['title']} - {result['track']['subtitle']}")
-            return True
-
-    print("❌ Shazam: No match")
-    return False
-
-
-# ================= ACRCLOUD =================
-async def detect_acrcloud(audio_path, segment_duration):
-    if not ACRCLOUD_ACCESS_KEY or not ACRCLOUD_ACCESS_SECRET:
-        return False
-
-    for segment, sr in generate_segments(audio_path, segment_duration):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, segment, sr)
-            tmp_path = tmp.name
-
-        timestamp = str(int(time.time()))
-        string_to_sign = f"POST\n/v1/identify\n{ACRCLOUD_ACCESS_KEY}\naudio\n1\n{timestamp}"
-        signature = base64.b64encode(
-            hmac.new(ACRCLOUD_ACCESS_SECRET.encode(), string_to_sign.encode(), hashlib.sha1).digest()
-        ).decode()
-
-        data = {
-            "access_key": ACRCLOUD_ACCESS_KEY,
-            "sample_bytes": os.path.getsize(tmp_path),
-            "timestamp": timestamp,
-            "signature": signature,
-            "data_type": "audio",
-            "signature_version": "1",
-        }
-
-        async with aiohttp.ClientSession() as session:
-            with open(tmp_path, "rb") as f:
-                async with session.post(
-                    f"https://{ACRCLOUD_HOST}/v1/identify",
-                    data={**data, "sample": f},
-                ) as resp:
-                    result = await resp.json()
-
-        os.unlink(tmp_path)
-
-        if result.get("status", {}).get("code") == 0:
-            music = result["metadata"]["music"][0]
-            print(f"🎶 ACRCloud: {music['title']} - {music['artists'][0]['name']}")
-            return True
-
-    print("❌ ACRCloud: No match")
-    return False
+    if "track" in result:
+        track = result["track"]
+        print("\n🎶 Song Found:")
+        print(f"Title : {track['title']}")
+        print(f"Artist: {track['subtitle']}")
+    else:
+        print("\n❌ No match found")
 
 
 # ================= MAIN =================
 async def main():
-    platform, video_id, start_time = parse_url(URL)
-    audio_path = f"{video_id}_{start_time}.m4a"
+    try:
+        download_audio_segment(URL, OUTPUT_FILE)
+        await detect_song(OUTPUT_FILE)
+        print("\n[INFO] Done")
 
-    print(f"[INFO] Platform detected: {platform}")
-
-    download_audio(URL, platform, audio_path, start_time)
-
-    found = await detect_shazam(audio_path, SEGMENT_DURATION)
-
-    if not found:
-        await detect_acrcloud(audio_path, SEGMENT_DURATION)
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
 
 
-# ================= RUN =================
 if __name__ == "__main__":
     asyncio.run(main())
