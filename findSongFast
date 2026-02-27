@@ -1,98 +1,70 @@
 import asyncio
-import os
-from urllib.parse import urlparse
 import yt_dlp
+import subprocess
 from shazamio import Shazam
-from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
-# ================= CONFIG =================
-URL = "https://www.facebook.com/reel/905121505331321"
-SEGMENT_DURATION = 10  # seconds
+URL = "https://www.youtube.com/watch?v=iO47TeQbDtY&t=2728s"
+CLIP_DURATION = 10
 
-# ================= SAFE FILENAME FROM URL =================
-def safe_filename_from_url(url: str) -> str:
-    """
-    Generate a Windows-safe filename from URL using only strings.
-    Keeps only letters, digits, '-' and '_'.
-    """
-    parsed = urlparse(url)
-    video_id = parsed.path.strip("/").split("/")[-1]
 
-    safe_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-    cleaned = "".join(ch for ch in video_id if ch in safe_chars)
+# -------- Parse timestamp --------
+parsed = urlparse(URL)
+qs = parse_qs(parsed.query)
+START_TIME = int(qs.get("t", ["0"])[0].replace("s", ""))
 
-    if not cleaned:
-        cleaned = "unknown"
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{cleaned}_first_10_seconds_{timestamp}.wav"
-
-# Output filename
-OUTPUT_FILE = safe_filename_from_url(URL)
-
-# ================= AUDIO DOWNLOAD =================
-def download_audio_segment(url: str, output_path: str):
-    print("[INFO] Downloading first 10 seconds...")
-
+# -------- Get direct audio stream URL --------
+def get_audio_stream():
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio",   # audio only
-        "cookiesfrombrowser": ("firefox",),         # Firefox cookies for auth
-        "outtmpl": "temp_audio.%(ext)s",
+        "format": "bestaudio",
         "quiet": True,
-        "no_warnings": True,
-        "download_sections": [{"start_time": 0, "end_time": SEGMENT_DURATION}],
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
+        "skip_download": True
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-    # Pick the most recently created WAV file to rename
-    wav_files = [f for f in os.listdir() if f.endswith(".wav")]
-    if not wav_files:
-        raise Exception("No WAV file found after download")
-
-    latest_wav = max(wav_files, key=lambda f: os.path.getmtime(f))
-    os.rename(latest_wav, output_path)
-
-    print(f"[SUCCESS] Audio segment saved as {output_path}")
+        info = ydl.extract_info(URL, download=False)
+        return info["url"]
 
 
-# ================= SHAZAM DETECTION =================
-async def detect_song(audio_path: str):
-    print("[INFO] Sending audio to Shazam...")
+# -------- Stream 10 seconds using ffmpeg --------
+def stream_clip(stream_url):
+    cmd = [
+        "ffmpeg",
+        "-ss", str(START_TIME),
+        "-t", str(CLIP_DURATION),
+        "-i", stream_url,
+        "-f", "wav",
+        "-ac", "1",
+        "-ar", "44100",
+        "pipe:1",
+        "-loglevel", "error"
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    audio_bytes, _ = process.communicate()
+    return audio_bytes
+
+
+# -------- Detect --------
+async def detect():
+    print("⚡ Streaming 10 seconds...")
+    stream_url = get_audio_stream()
+    audio_data = stream_clip(stream_url)
+
+    print("🔎 Detecting...")
     shazam = Shazam()
-
-    try:
-        # recognize_song ensures fresh recognition of the given file
-        result = await shazam.recognize_song(audio_path)
-    except Exception as e:
-        print(f"[ERROR] Shazam failed: {e}")
-        return
+    result = await shazam.recognize(audio_data)
 
     if "track" in result:
-        track = result["track"]
-        print("\n🎶 Song Found:")
-        print(f"Title : {track['title']}")
-        print(f"Artist: {track['subtitle']}")
+        print(f"\n🎶 {result['track']['title']} - {result['track']['subtitle']}")
     else:
-        print("\n❌ No match found")
+        print("❌ No song detected.")
 
 
-# ================= MAIN =================
-async def main():
-    try:
-        download_audio_segment(URL, OUTPUT_FILE)
-        await detect_song(OUTPUT_FILE)
-        print("\n[INFO] Done")
-
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(detect())
