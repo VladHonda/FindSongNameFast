@@ -1,38 +1,170 @@
+#!/usr/bin/env python3
+"""
+Find Song Fast - Detect songs from social media videos (TikTok, YouTube, Facebook, Instagram, etc.)
+Uses yt-dlp to extract audio and Shazam for song detection.
+"""
 import asyncio
 import yt_dlp
 import subprocess
+import os
+import tempfile
 from shazamio import Shazam
 from urllib.parse import urlparse, parse_qs
+import re
 
-URL = "https://www.youtube.com/watch?v=iO47TeQbDtY&t=2728s"
+# ============ CONFIGURATION ============
+# Example TikTok URL - change this to test different links
+# TikTok formats: https://www.tiktok.com/@user/video/ID, https://vm.tiktok.com/ID, etc.
+URL = "https://www.tiktok.com/@tiltproofk/video/7618700708883221782?lang=en"
 CLIP_DURATION = 10
 
 
-# -------- Parse timestamp --------
-parsed = urlparse(URL)
-qs = parse_qs(parsed.query)
-START_TIME = int(qs.get("t", ["0"])[0].replace("s", ""))
+# -------- Detect platform from URL --------
+def detect_platform(url):
+    """Detect the platform from URL"""
+    url = url.lower()
+    if "tiktok.com" in url:
+        return "tiktok"
+    elif "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
+    elif "facebook.com" in url or "fb.watch" in url:
+        return "facebook"
+    elif "instagram.com" in url:
+        return "instagram"
+    elif "twitter.com" in url or "x.com" in url:
+        return "twitter"
+    else:
+        return "unknown"
 
 
-# -------- Get direct audio stream URL --------
-def get_audio_stream():
+# -------- Parse timestamp from URL --------
+def parse_timestamp(url):
+    """Extract start time from URL query parameters"""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    # TikTok uses 't', YouTube uses 't' or 'start'
+    return int(qs.get("t", ["0"])[0].replace("s", ""))
+
+
+# -------- Download audio/video and extract clip --------
+def download_and_extract_audio(url, start_time=0, duration=10):
+    """Download media and extract audio clip using yt-dlp + ffmpeg"""
+    platform = detect_platform(url)
+    
+    # Create temp directory
+    temp_dir = tempfile.gettempdir()
+    output_template = os.path.join(temp_dir, "findSongFast_audio")
+    
+    # Base yt-dlp options
     ydl_opts = {
-        "format": "bestaudio",
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
         "quiet": True,
-        "skip_download": True
+        "no_warnings": True,
+        "progress_hooks": [lambda d: None],  # Suppress progress
     }
+    
+    # Platform-specific options
+    if platform == "tiktok":
+        ydl_opts.update({
+            "extractor_args": {
+                "tiktok": {
+                    "webpage": True,
+                }
+            },
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+        })
+    
+    print("⬇️  Downloading audio...")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+        # Find the downloaded file
+        downloaded_files = []
+        for ext in ["m4a", "mp3", "webm", "mp4", "wav"]:
+            f = f"{output_template}.{ext}"
+            if os.path.exists(f):
+                downloaded_files.append(f)
+        
+        if not downloaded_files:
+            # Try with original filename
+            if "requested_downloads" in info:
+                for item in info["requested_downloads"]:
+                    if "filepath" in item and os.path.exists(item["filepath"]):
+                        downloaded_files.append(item["filepath"])
+        
+        if not downloaded_files:
+            raise Exception("No file was downloaded")
+        
+        audio_file = downloaded_files[0]
+        print(f"✅ Downloaded: {os.path.basename(audio_file)}")
+        
+        # Extract clip using ffmpeg
+        print("✂️  Extracting clip...")
+        clip_path = os.path.join(temp_dir, "findSongFast_clip.wav")
+        
+        cmd = [
+            "ffmpeg",
+            "-ss", str(start_time),
+            "-t", str(duration),
+            "-i", audio_file,
+            "-f", "wav",
+            "-ac", "1",
+            "-ar", "44100",
+            "-y",  # Overwrite
+            clip_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error: {result.stderr}")
+        
+        # Read the clip
+        with open(clip_path, "rb") as f:
+            audio_data = f.read()
+        
+        # Cleanup
+        try:
+            os.remove(audio_file)
+            os.remove(clip_path)
+        except:
+            pass
+        
+        return audio_data
+        
+    except Exception as e:
+        raise Exception(f"Download failed: {e}")
 
+
+# -------- Get direct audio stream URL (for platforms that support it) --------
+def get_audio_stream(url):
+    """Extract audio stream URL using yt-dlp - works best for YouTube"""
+    platform = detect_platform(url)
+    
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "skip_download": True,
+        "no_warnings": True,
+    }
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(URL, download=False)
+        info = ydl.extract_info(url, download=False)
         return info["url"]
 
 
-# -------- Stream 10 seconds using ffmpeg --------
-def stream_clip(stream_url):
+# -------- Stream audio using ffmpeg (for direct URLs) --------
+def stream_clip(stream_url, start_time=0, duration=10):
+    """Stream audio clip using ffmpeg from direct URL"""
     cmd = [
         "ffmpeg",
-        "-ss", str(START_TIME),
-        "-t", str(CLIP_DURATION),
+        "-ss", str(start_time),
+        "-t", str(duration),
         "-i", stream_url,
         "-f", "wav",
         "-ac", "1",
@@ -47,24 +179,64 @@ def stream_clip(stream_url):
         stderr=subprocess.PIPE
     )
 
-    audio_bytes, _ = process.communicate()
+    audio_bytes, stderr = process.communicate()
+    
+    if not audio_bytes:
+        raise Exception(f"No audio data: {stderr.decode()}")
+    
     return audio_bytes
 
 
-# -------- Detect --------
-async def detect():
-    print("⚡ Streaming 10 seconds...")
-    stream_url = get_audio_stream()
-    audio_data = stream_clip(stream_url)
+# -------- Detect song using Shazam --------
+async def detect(url=None):
+    """Main detection function"""
+    if url is None:
+        url = URL
+    
+    platform = detect_platform(url)
+    start_time = parse_timestamp(url)
+    
+    print(f"🎵 Detecting song from: {platform.upper()}")
+    print(f"📎 URL: {url}")
+    print(f"⏰ Start time: {start_time}s")
+    
+    try:
+        # Try direct streaming for YouTube, download for others (TikTok, etc.)
+        if platform == "youtube":
+            print("\n⚡ Streaming audio...")
+            stream_url = get_audio_stream(url)
+            audio_data = stream_clip(stream_url, start_time, CLIP_DURATION)
+        else:
+            # Download method (more reliable for TikTok, Facebook, etc.)
+            audio_data = download_and_extract_audio(url, start_time, CLIP_DURATION)
 
-    print("🔎 Detecting...")
-    shazam = Shazam()
-    result = await shazam.recognize(audio_data)
+        print("🔎 Detecting song...")
+        shazam = Shazam()
+        result = await shazam.recognize(audio_data)
 
-    if "track" in result:
-        print(f"\n🎶 {result['track']['title']} - {result['track']['subtitle']}")
+        if "track" in result:
+            track = result["track"]
+            print(f"\n✅ 🎶 Found: {track['title']} - {track['subtitle']}")
+            if "images" in track and "coverart" in track["images"]:
+                print(f"🖼️  Cover: {track['images']['coverart']}")
+            return track
+        else:
+            print("❌ No song detected. Try a different clip or longer duration.")
+            return None
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+if __name__ == "__main__":
+    import sys
+    
+    # Allow passing URL as command line argument
+    if len(sys.argv) > 1:
+        test_url = sys.argv[1]
     else:
-        print("❌ No song detected.")
-
-
-asyncio.run(detect())
+        test_url = URL
+    
+    asyncio.run(detect(test_url))
