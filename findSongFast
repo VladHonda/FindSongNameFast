@@ -1,242 +1,244 @@
 #!/usr/bin/env python3
+
 """
-Find Song Fast - Detect songs from social media videos (TikTok, YouTube, Facebook, Instagram, etc.)
-Uses yt-dlp to extract audio and Shazam for song detection.
+Smart Song Detector — Fixed to use URL timestamp correctly.
+
+Key fixes:
+  1. Uses the start offset from URL (1351s) as the base scanning point
+  2. Scans ±10 seconds around that timestamp (captures the actual song)
+  3. Better audio preprocessing for Shazam
+  4. Fallback: if no match at timestamp, scan nearby ranges
 """
+
 import asyncio
 import yt_dlp
 import subprocess
 import os
 import tempfile
+import re
 from shazamio import Shazam
 from urllib.parse import urlparse, parse_qs
-import re
 
-# ============ CONFIGURATION ============
-# Example TikTok URL - change this to test different links
-# TikTok formats: https://www.tiktok.com/@user/video/ID, https://vm.tiktok.com/ID, etc.
-URL = "https://www.tiktok.com/@tiltproofk/video/7618700708883221782?lang=en"
-CLIP_DURATION = 10
+# ================= CONFIG =================
+URL = """
+https://www.youtube.com/watch?v=fXPKz1klRg0&t=1351s
+"""
 
+CLIP_DURATION = 20        # 20-second clips (optimal for Shazam)
+SCAN_WINDOW = 30          # scan from (timestamp - 15s) to (timestamp + 15s)
+STEP = 5                  # try every 5 seconds within window
+MAX_CONCURRENT = 2
 
-# -------- Detect platform from URL --------
-def detect_platform(url):
-    """Detect the platform from URL"""
+# Audio preprocessing
+NORMALIZE = True
+BOOST_MIDS = True
+
+# ================= HELPERS =================
+def detect_platform(url: str) -> str:
     url = url.lower()
-    if "tiktok.com" in url:
-        return "tiktok"
-    elif "youtube.com" in url or "youtu.be" in url:
-        return "youtube"
-    elif "facebook.com" in url or "fb.watch" in url:
-        return "facebook"
-    elif "instagram.com" in url:
-        return "instagram"
-    elif "twitter.com" in url or "x.com" in url:
-        return "twitter"
-    else:
-        return "unknown"
+    if "youtu" in url: return "youtube"
+    if "tiktok.com" in url: return "tiktok"
+    if "instagram.com" in url: return "instagram"
+    if "facebook.com" in url: return "facebook"
+    return "unknown"
 
-
-# -------- Parse timestamp from URL --------
-def parse_timestamp(url):
-    """Extract start time from URL query parameters"""
+def parse_timestamp(url: str) -> int:
+    """Extract start offset from URL (e.g., &t=1351s → 1351)"""
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
-    # TikTok uses 't', YouTube uses 't' or 'start'
-    return int(qs.get("t", ["0"])[0].replace("s", ""))
+    raw = qs.get("t") or qs.get("start") or ["0"]
+    t = raw[0]
 
+    if t.isdigit():
+        return int(t)
 
-# -------- Download audio/video and extract clip --------
-def download_and_extract_audio(url, start_time=0, duration=10):
-    """Download media and extract audio clip using yt-dlp + ffmpeg"""
-    platform = detect_platform(url)
-    
-    # Create temp directory
+    match = re.match(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", t)
+    if match:
+        h = int(match.group(1) or 0)
+        m = int(match.group(2) or 0)
+        s = int(match.group(3) or 0)
+        return h * 3600 + m * 60 + s
+    return 0
+
+# ================= DOWNLOAD =================
+def download_audio(url: str, platform: str) -> str:
     temp_dir = tempfile.gettempdir()
-    output_template = os.path.join(temp_dir, "findSongFast_audio")
-    
-    # Base yt-dlp options
+    outtmpl = os.path.join(temp_dir, "findsong.%(ext)s")
+
+    print(f"⬇️ Downloading from {platform}...")
+
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": output_template,
+        "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
-        "progress_hooks": [lambda d: None],  # Suppress progress
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "wav",
+            "preferredquality": "192",
+        }],
     }
-    
-    # Platform-specific options
-    if platform == "tiktok":
-        ydl_opts.update({
-            "extractor_args": {
-                "tiktok": {
-                    "webpage": True,
-                }
-            },
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            }
-        })
-    
-    print("⬇️  Downloading audio...")
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-        # Find the downloaded file
-        downloaded_files = []
-        for ext in ["m4a", "mp3", "webm", "mp4", "wav"]:
-            f = f"{output_template}.{ext}"
-            if os.path.exists(f):
-                downloaded_files.append(f)
-        
-        if not downloaded_files:
-            # Try with original filename
-            if "requested_downloads" in info:
-                for item in info["requested_downloads"]:
-                    if "filepath" in item and os.path.exists(item["filepath"]):
-                        downloaded_files.append(item["filepath"])
-        
-        if not downloaded_files:
-            raise Exception("No file was downloaded")
-        
-        audio_file = downloaded_files[0]
-        print(f"✅ Downloaded: {os.path.basename(audio_file)}")
-        
-        # Extract clip using ffmpeg
-        print("✂️  Extracting clip...")
-        clip_path = os.path.join(temp_dir, "findSongFast_clip.wav")
-        
-        cmd = [
-            "ffmpeg",
-            "-ss", str(start_time),
-            "-t", str(duration),
-            "-i", audio_file,
-            "-f", "wav",
-            "-ac", "1",
-            "-ar", "44100",
-            "-y",  # Overwrite
-            clip_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg error: {result.stderr}")
-        
-        # Read the clip
-        with open(clip_path, "rb") as f:
-            audio_data = f.read()
-        
-        # Cleanup
-        try:
-            os.remove(audio_file)
-            os.remove(clip_path)
-        except:
-            pass
-        
-        return audio_data
-        
-    except Exception as e:
-        raise Exception(f"Download failed: {e}")
 
+    if platform == "facebook":
+        ydl_opts["cookiesfrombrowser"] = ("firefox",)
 
-# -------- Get direct audio stream URL (for platforms that support it) --------
-def get_audio_stream(url):
-    """Extract audio stream URL using yt-dlp - works best for YouTube"""
-    platform = detect_platform(url)
-    
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "skip_download": True,
-        "no_warnings": True,
-    }
-    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info["url"]
+        ydl.extract_info(url, download=True)
 
+    base = outtmpl.replace(".%(ext)s", "")
+    wav_path = f"{base}.wav"
+    if os.path.exists(wav_path):
+        print(f"✅ Downloaded: {wav_path}")
+        return wav_path
 
-# -------- Stream audio using ffmpeg (for direct URLs) --------
-def stream_clip(stream_url, start_time=0, duration=10):
-    """Stream audio clip using ffmpeg from direct URL"""
+    raise Exception("Download failed — no WAV file")
+
+# ================= AUDIO PREPROCESSING =================
+def preprocess_clip(input_path: str, output_path: str, offset: int):
+    """
+    Extract a clip with preprocessing optimized for Shazam:
+      - Normalize loudness
+      - Boost mid frequencies (where vocals/instruments live)
+      - Ensure mono 44.1kHz
+    """
+    filters = []
+    if NORMALIZE:
+        filters.append("loudnorm=I=-14:TP=-1.5:LRA=11")
+    if BOOST_MIDS:
+        # Boost 1-4 kHz by 6 dB
+        filters.append("equalizer=f=2000:width_type=h:width=3000:g=6.0")
+
+    af = ",".join(filters) if filters else "copy"
+
     cmd = [
-        "ffmpeg",
-        "-ss", str(start_time),
-        "-t", str(duration),
-        "-i", stream_url,
-        "-f", "wav",
+        "ffmpeg", "-y",
+        "-ss", str(offset),
+        "-t", str(CLIP_DURATION),
+        "-i", input_path,
+        "-af", af,
+        "-acodec", "pcm_s16le",
         "-ac", "1",
         "-ar", "44100",
-        "pipe:1",
-        "-loglevel", "error"
+        output_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if not os.path.exists(output_path):
+        raise Exception(f"Failed to create clip at {offset}s")
+
+# ================= ASYNC CLIP =================
+async def extract_clip(audio_path: str, offset: int) -> str:
+    output = os.path.join(tempfile.gettempdir(), f"clip_{offset}.wav")
+    await asyncio.to_thread(preprocess_clip, audio_path, output, offset)
+    return output
+
+# ================= WORKER =================
+async def recognize_worker(audio_path, offset, shazam, sem):
+    async with sem:
+        try:
+            print(f"🔍 Scanning {offset}s...")
+            clip = await extract_clip(audio_path, offset)
+            result = await shazam.recognize(clip)
+
+            if result and "track" in result:
+                track = result["track"]
+                print(f"   ✅ MATCH: {track.get('title')} — {track.get('subtitle')}")
+                return offset, track
+        except Exception as e:
+            print(f"   ⚠️  Offset {offset}s error: {str(e)[:60]}")
+        return offset, None
+
+# ================= SMART SCANNER =================
+async def scan_at_timestamp(audio_path, base_offset, shazam, sem):
+    """
+    Scan a window around the given timestamp.
+    Tries offsets: base_offset ± {0, 5, 10, 15, 20, 25} seconds
+    """
+    offsets = [base_offset + d for d in [0, -5, 5, -10, 10, -15, 15, -20, 20, -25, 25]]
+    offsets = [o for o in offsets if o >= 0]  # filter negative
+
+    print(f"🎯 Scanning around {base_offset}s (window: ±{SCAN_WINDOW//2}s)")
+
+    tasks = [
+        asyncio.create_task(recognize_worker(audio_path, o, shazam, sem))
+        for o in offsets
     ]
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+    for task in asyncio.as_completed(tasks):
+        offset, track = await task
+        if track:
+            for t in tasks: t.cancel()
+            return offset, track
 
-    audio_bytes, stderr = process.communicate()
-    
-    if not audio_bytes:
-        raise Exception(f"No audio data: {stderr.decode()}")
-    
-    return audio_bytes
+    return None, None
 
-
-# -------- Detect song using Shazam --------
-async def detect(url=None):
-    """Main detection function"""
-    if url is None:
-        url = URL
-    
+# ================= MAIN =================
+async def detect(url: str):
     platform = detect_platform(url)
-    start_time = parse_timestamp(url)
-    
-    print(f"🎵 Detecting song from: {platform.upper()}")
-    print(f"📎 URL: {url}")
-    print(f"⏰ Start time: {start_time}s")
-    
+    start_offset = parse_timestamp(url)
+
+    print("\n🎵 SMART SONG DETECTOR")
+    print(f"📎 {url}")
+    print(f"🌐 {platform}")
+    print(f"📍 Timestamp: {start_offset}s\n")
+
     try:
-        # Try direct streaming for YouTube, download for others (TikTok, etc.)
-        if platform == "youtube":
-            print("\n⚡ Streaming audio...")
-            stream_url = get_audio_stream(url)
-            audio_data = stream_clip(stream_url, start_time, CLIP_DURATION)
-        else:
-            # Download method (more reliable for TikTok, Facebook, etc.)
-            audio_data = download_and_extract_audio(url, start_time, CLIP_DURATION)
+        audio = download_audio(url, platform)
+        print()
 
-        print("🔎 Detecting song...")
         shazam = Shazam()
-        result = await shazam.recognize(audio_data)
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-        if "track" in result:
-            track = result["track"]
-            print(f"\n✅ 🎶 Found: {track['title']} - {track['subtitle']}")
-            if "images" in track and "coverart" in track["images"]:
-                print(f"🖼️  Cover: {track['images']['coverart']}")
+        # Primary scan: around the timestamp you specified
+        offset, track = await scan_at_timestamp(audio, start_offset, shazam, sem)
+
+        if track:
+            print(f"\n{'='*50}")
+            print(f"✅ FOUND at {offset}s")
+            print(f"🎶 Title:   {track.get('title', 'Unknown')}")
+            print(f"👤 Artist:  {track.get('subtitle', 'Unknown')}")
+            print(f"📀 Album:   {track.get('album', 'N/A')}")
+            print(f"🎼 Genre:   {track.get('genre', 'N/A')}")
+            print(f"{'='*50}")
             return track
-        else:
-            print("❌ No song detected. Try a different clip or longer duration.")
-            return None
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+
+        # Fallback: scan broader ranges if timestamp guess was wrong
+        print("\n⚠️  No match at timestamp — trying broader scan...")
+        for wide_range in [(0, 120), (120, 300), (300, 600)]:
+            print(f"🔬 Scanning {wide_range[0]}–{wide_range[1]}s...")
+            test_offsets = list(range(wide_range[0], wide_range[1], 10))
+            tasks = [
+                asyncio.create_task(recognize_worker(audio, o, shazam, sem))
+                for o in test_offsets
+            ]
+            for task in asyncio.as_completed(tasks):
+                off, trk = await task
+                if trk:
+                    for t in tasks: t.cancel()
+                    print(f"\n{'='*50}")
+                    print(f"✅ FOUND at {off}s")
+                    print(f"🎶 {trk.get('title')} — {trk.get('subtitle')}")
+                    print(f"{'='*50}")
+                    return trk
+
+        print("\n❌ No match found after full scan")
+        print("\n💡 Suggestions:")
+        print("   • The song may be low-volume or heavily mixed with speech")
+        print("   • Try manually specifying the exact second in the URL")
+        print("   • Export a clean 20s clip yourself and run Shazam on your phone")
         return None
 
+    finally:
+        # Cleanup temp files
+        try:
+            tmp = tempfile.gettempdir()
+            for f in os.listdir(tmp):
+                if f.startswith("clip_") or "findsong" in f:
+                    try: os.remove(os.path.join(tmp, f))
+                    except: pass
+        except: pass
 
+# ================= RUN =================
 if __name__ == "__main__":
-    import sys
-    
-    # Allow passing URL as command line argument
-    if len(sys.argv) > 1:
-        test_url = sys.argv[1]
-    else:
-        test_url = URL
-    
-    asyncio.run(detect(test_url))
+    asyncio.run(detect(URL))
