@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#https://www.youtube.com/watch?v=xQLe6ivNYu8 Hampus Naeselius - Signal to Noise
+
 """
 Smart Song Detector — Fixed to use URL timestamp correctly.
 
@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 # ================= CONFIG =================
 URL = """
-https://www.youtube.com/watch?v=fXPKz1klRg0&t=1351s
+https://www.facebook.com/reel/1466633814664316
 """
 
 CLIP_DURATION = 20        # 20-second clips (optimal for Shazam)
