@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 # ================= CONFIG =================
 URL = """
-https://www.facebook.com/reel/1466633814664316
+your link goes here
 """
 
 CLIP_DURATION = 20        # 20-second clips (optimal for Shazam)
